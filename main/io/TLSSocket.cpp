@@ -2,6 +2,7 @@
 
 #include <mbedtls/ctr_drbg.h>     // for mbedtls_ctr_drbg_free, mbedtls_ctr_...
 #include <mbedtls/entropy.h>      // for mbedtls_entropy_free, mbedtls_entro...
+#include <mbedtls/error.h>        // Jukebox-fix: mbedtls_strerror for readable errors
 #include <mbedtls/net_sockets.h>  // for mbedtls_net_connect, mbedtls_net_free
 #include <mbedtls/ssl.h>          // for mbedtls_ssl_conf_authmode, mbedtls_...
 #include <cstring>                // for strlen, NULL
@@ -19,9 +20,8 @@ bell::TLSSocket::TLSSocket() {
   mbedtls_ssl_init(&ssl);
   mbedtls_ssl_config_init(&conf);
 
-  if (bell::X509Bundle::shouldVerify()) {
-    bell::X509Bundle::attach(&conf);
-  }
+  // Jukebox-fix: X509Bundle::attach() was here, but mbedtls requires
+  // ssl_config_defaults() to run first. Moved into open() after defaults.
 
   mbedtls_ctr_drbg_init(&ctr_drbg);
   mbedtls_entropy_init(&entropy);
@@ -39,39 +39,57 @@ bell::TLSSocket::TLSSocket() {
 
 void bell::TLSSocket::open(const std::string& hostUrl, uint16_t port) {
   int ret;
+  char err_buf[128];
+
   if ((ret = mbedtls_net_connect(&server_fd, hostUrl.c_str(),
                                  std::to_string(port).c_str(),
                                  MBEDTLS_NET_PROTO_TCP)) != 0) {
-    BELL_LOG(error, "http_tls", "failed! connect returned %d\n", ret);
+    // Jukebox-fix: was silently continuing — caused hangs deep in handshake.
+    mbedtls_strerror(ret, err_buf, sizeof(err_buf));
+    BELL_LOG(error, "http_tls", "mbedtls_net_connect %s:%u failed: -0x%04x %s",
+             hostUrl.c_str(), port, -ret, err_buf);
+    throw std::runtime_error("mbedtls_net_connect failed");
   }
 
   if ((ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT,
                                          MBEDTLS_SSL_TRANSPORT_STREAM,
                                          MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
 
-    BELL_LOG(error, "http_tls", "failed! config returned %d\n", ret);
+    mbedtls_strerror(ret, err_buf, sizeof(err_buf));
+    BELL_LOG(error, "http_tls", "ssl_config_defaults failed: -0x%04x %s",
+             -ret, err_buf);
     throw std::runtime_error("mbedtls_ssl_config_defaults failed");
   }
 
   // Only verify if the X509 bundle is present
   if (bell::X509Bundle::shouldVerify()) {
+    // Jukebox-fix: attach the cert bundle HERE, after ssl_config_defaults.
+    // Previously called in the constructor against an uninitialised config.
+    bell::X509Bundle::attach(&conf);
     mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_REQUIRED);
   } else {
     mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
   }
 
   mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
+
+  // Jukebox-fix: bound read time so a stalled peer can't hang the task.
+  mbedtls_ssl_conf_read_timeout(&conf, 15000);  // 15 s
+
   mbedtls_ssl_setup(&ssl, &conf);
 
   if ((ret = mbedtls_ssl_set_hostname(&ssl, hostUrl.c_str())) != 0) {
     throw std::runtime_error("mbedtls_ssl_set_hostname failed");
   }
-  mbedtls_ssl_set_bio(&ssl, &server_fd, mbedtls_net_send, mbedtls_net_recv,
-                      NULL);
+  // Jukebox-fix: use the timeout-aware recv so conf_read_timeout takes effect.
+  mbedtls_ssl_set_bio(&ssl, &server_fd, mbedtls_net_send, NULL,
+                      mbedtls_net_recv_timeout);
 
   while ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
     if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-      BELL_LOG(error, "http_tls", "failed! config returned %d\n", ret);
+      mbedtls_strerror(ret, err_buf, sizeof(err_buf));
+      BELL_LOG(error, "http_tls", "ssl_handshake failed: -0x%04x %s",
+               -ret, err_buf);
       throw std::runtime_error("mbedtls_ssl_handshake error");
     }
   }

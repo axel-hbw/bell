@@ -244,7 +244,9 @@ int getnameinfo(const struct sockaddr *sa, socklen_t salen,
 }
 
 
-#define HTTP_ESP_STACK (1024 * 16)
+/* Jukebox-fix: bumped 16 KB → 48 KB. ZeroConf/HTTP server overflowed during
+ * TLS handshake work on civetweb worker threads. */
+#define HTTP_ESP_STACK (1024 * 48)
 
 #endif
 
@@ -335,6 +337,10 @@ typedef struct {
   size_t stack_size;
   mg_thread_func_t entry_func;
   void* param;
+  /* Jukebox-fix: on dual-core ESP32 the spawning task could return and free
+   * its stack frame (containing this struct) before the new task copied the
+   * fields. The new task signals here once it has copied entry_func/param. */
+  volatile int ready;
 } cw_freertos_handle;
 
 typedef cw_freertos_handle cw_thread_handle_t;
@@ -343,7 +349,13 @@ typedef cw_freertos_handle cw_thread_handle_t;
 static void freeRTOSTaskEntryFunc(void* handle) {
   cw_thread_handle_t* task_param = (cw_thread_handle_t*) handle;
 
-  task_param->entry_func(task_param->param);
+  /* Jukebox-fix: copy fields to locals BEFORE signalling ready, so the
+   * starter can free its stack frame as soon as we set ready=1. */
+  mg_thread_func_t entry = task_param->entry_func;
+  void* param = task_param->param;
+  task_param->ready = 1;
+
+  entry(param);
 
   // TCB are cleanup in IDLE task, so give it some time
   // TODO: IMPLEMENT TCB CLEANUP
@@ -5824,12 +5836,20 @@ mg_start_thread(mg_thread_func_t func, void *param)
 #if defined(ESP_PLATFORM)
   thread_id.stack_size = (HTTP_ESP_STACK + sizeof(StackType_t) - 1) / sizeof(StackType_t);
   thread_id.task_buffer = (StaticTask_t*) heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); 
-  thread_id.x_stack = (StackType_t*) heap_caps_malloc(thread_id.stack_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  /* Jukebox-fix: stack_size is in StackType_t units; malloc needs bytes. */
+  thread_id.x_stack = (StackType_t*) heap_caps_malloc(thread_id.stack_size * sizeof(StackType_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   thread_id.param = param;
   thread_id.entry_func = func;
+  thread_id.ready = 0;
   thread_id.task_handle = xTaskCreateStaticPinnedToCore(freeRTOSTaskEntryFunc, "civetweb", thread_id.stack_size, &thread_id,
                   CONFIG_ESP32_PTHREAD_TASK_PRIO_DEFAULT, thread_id.x_stack, thread_id.task_buffer, 1);
   if (thread_id.task_handle != NULL) {
+    /* Jukebox-fix: spin until the new task copies entry_func/param. Otherwise
+     * the caller can return and free thread_id while the new task is still
+     * reading from it. */
+    while (!thread_id.ready) {
+      vTaskDelay(1);
+    }
     result = 0;
   } else {
     result = -1;
@@ -5871,12 +5891,18 @@ mg_start_thread_with_id(mg_thread_func_t func,
 
   thread_id.stack_size = (HTTP_ESP_STACK + sizeof(StackType_t) - 1) / sizeof(StackType_t);
   thread_id.task_buffer = (StaticTask_t*) heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); 
-  thread_id.x_stack = (StackType_t*) heap_caps_malloc(thread_id.stack_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  /* Jukebox-fix: stack_size is in StackType_t units; malloc needs bytes. */
+  thread_id.x_stack = (StackType_t*) heap_caps_malloc(thread_id.stack_size * sizeof(StackType_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   thread_id.param = param;
   thread_id.entry_func = func;
+  thread_id.ready = 0;
   thread_id.task_handle = xTaskCreateStaticPinnedToCore(freeRTOSTaskEntryFunc, "civetweb", thread_id.stack_size, &thread_id,
                   CONFIG_ESP32_PTHREAD_TASK_PRIO_DEFAULT, thread_id.x_stack, thread_id.task_buffer, 1);
   if (thread_id.task_handle != NULL) {
+    /* Jukebox-fix: spin until the new task copies entry_func/param. */
+    while (!thread_id.ready) {
+      vTaskDelay(1);
+    }
     result = 0;
 		*threadidptr = thread_id;
   } else {

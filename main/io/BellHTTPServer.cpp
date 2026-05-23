@@ -49,8 +49,13 @@ class WebSocketHandler : public CivetWebSocketHandler {
     return true;
   }
 
-  virtual void handleClose(CivetServer* server, struct mg_connection* conn) {
-    stateHandler(conn, BellHTTPServer::WSState::CLOSED);
+  // Jukebox-fix: newer civetweb declares the base handleClose with a
+  // const mg_connection*. Match it here and cast away const for the user
+  // state handler, which still takes a mutable pointer.
+  virtual void handleClose(CivetServer* server,
+                           const struct mg_connection* conn) {
+    stateHandler(const_cast<struct mg_connection*>(conn),
+                 BellHTTPServer::WSState::CLOSED);
   }
 };
 

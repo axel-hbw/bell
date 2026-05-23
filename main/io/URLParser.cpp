@@ -1,5 +1,7 @@
 #include "URLParser.h"
 
+#include <cstring>  // Jukebox-fix: strstr/strncmp need explicit include under IDF v5
+
 namespace bell {
 
 #ifdef BELL_DISABLE_REGEX
