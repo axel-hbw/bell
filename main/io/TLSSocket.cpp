@@ -11,6 +11,10 @@
 #include "BellLogger.h"  // for AbstractLogger, BELL_LOG
 #include "X509Bundle.h"  // for shouldVerify, attach
 
+#ifdef ESP_PLATFORM
+#include "esp_crt_bundle.h"
+#endif
+
 /**
  * Platform TLSSocket implementation for the mbedtls
  */
@@ -61,15 +65,24 @@ void bell::TLSSocket::open(const std::string& hostUrl, uint16_t port) {
     throw std::runtime_error("mbedtls_ssl_config_defaults failed");
   }
 
+#ifdef ESP_PLATFORM
+  // Jukebox-fix: cap at TLS 1.2.  TLS 1.3 on ESP32 via the raw mbedTLS API
+  // (without ESP-IDF's esp_tls wrapper) hits INTERNAL_ERROR during the key
+  // schedule; TLS 1.2 is well-tested and Spotify AP supports it.
+  mbedtls_ssl_conf_max_tls_version(&conf, MBEDTLS_SSL_VERSION_TLS1_2);
+
+  // Use the ESP-IDF cert bundle (DigiCert / Amazon CAs for Spotify AP servers).
+  esp_crt_bundle_attach(&conf);
+  mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+#else
   // Only verify if the X509 bundle is present
   if (bell::X509Bundle::shouldVerify()) {
-    // Jukebox-fix: attach the cert bundle HERE, after ssl_config_defaults.
-    // Previously called in the constructor against an uninitialised config.
     bell::X509Bundle::attach(&conf);
     mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_REQUIRED);
   } else {
     mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
   }
+#endif
 
   mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
 
