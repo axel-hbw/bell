@@ -81,6 +81,15 @@ class TCPSocket : public bell::Socket {
                (char*)&flag, /* the cast is historical cruft */
                sizeof(int)); /* length of option value */
 
+    // Jukebox-fix: bound recv() so a stalled peer can't hang the task
+    // indefinitely (mirrors the TLS conf_read_timeout). On timeout recv()
+    // returns <= 0, which SocketBuffer treats as end-of-stream.
+    struct timeval recvTimeout {};
+    recvTimeout.tv_sec = 15;
+    recvTimeout.tv_usec = 0;
+    setsockopt(sockFd, SOL_SOCKET, SO_RCVTIMEO, (char*)&recvTimeout,
+               sizeof(recvTimeout));
+
     freeaddrinfo(addr);
     isClosed = false;
   }

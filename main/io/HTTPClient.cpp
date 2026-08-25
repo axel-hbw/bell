@@ -79,6 +79,17 @@ void HTTPClient::Response::readResponseHeaders() {
     prevbuflen = httpBufferAvailable;
     httpBufferAvailable += socketStream.gcount();
 
+    // Jukebox-fix: a closed/reset keep-alive socket makes getline() extract
+    // zero bytes and set failbit. The original loop then spun forever
+    // (phr_parse_response keeps returning -2 because the buffer never grows),
+    // pinning the CPU and starving the idle task -> task_wdt on cspot_player.
+    // A truncated read that finds no delimiter fills the buffer (gcount > 0)
+    // and is caught by the "Response too large" check below, so gcount == 0
+    // reliably means the peer went away before the headers arrived.
+    if (socketStream.gcount() == 0) {
+      throw std::runtime_error("HTTP connection closed before response headers");
+    }
+
     // Restore delimiters
     memcpy(httpBuffer.data() + httpBufferAvailable - 2, "\r\n", 2);
 
