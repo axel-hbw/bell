@@ -34,32 +34,58 @@ void HTTPClient::Response::rawRequest(const std::string& url,
   // Prepare a request
   const char* reqEnd = "\r\n";
 
-  socketStream << method << " " << urlParser.path << " HTTP/1.1" << reqEnd;
-  socketStream << "Host: " << urlParser.host << ":" << urlParser.port << reqEnd;
-  socketStream << "Connection: keep-alive" << reqEnd;
-  socketStream << "Accept: */*" << reqEnd;
+  // Jukebox-fix: this Response reuses one keep-alive socket across requests
+  // (CDNAudioFile issues header -> footer -> many range reads on it). Spotify's
+  // CDN drops idle keep-alive sockets, notably during the ~5 s Connect
+  // handshake before the first data read. Writing into that dead socket makes
+  // readResponseHeaders() see zero bytes and throw "closed before response
+  // headers" -> the track ends without a note (see CDNAudioFile catch).
+  // Reopen a fresh socket and replay the request once before giving up. GETs
+  // are idempotent and a zero-response POST never reached the peer, so a single
+  // retry is safe. Bounded to one retry so a genuinely unreachable host still
+  // surfaces the error instead of spinning.
+  for (int attempt = 0;; attempt++) {
+    try {
+      socketStream << method << " " << urlParser.path << " HTTP/1.1" << reqEnd;
+      socketStream << "Host: " << urlParser.host << ":" << urlParser.port
+                   << reqEnd;
+      socketStream << "Connection: keep-alive" << reqEnd;
+      socketStream << "Accept: */*" << reqEnd;
 
-  // Write content
-  if (content.size() > 0) {
-    socketStream << "Content-Length: " << content.size() << reqEnd;
+      // Write content
+      if (content.size() > 0) {
+        socketStream << "Content-Length: " << content.size() << reqEnd;
+      }
+
+      // Write headers
+      for (auto& header : headers) {
+        socketStream << header.first << ": " << header.second << reqEnd;
+      }
+
+      socketStream << reqEnd;
+
+      // Write request body
+      if (content.size() > 0) {
+        socketStream.write((const char*)content.data(), content.size());
+      }
+
+      socketStream.flush();
+
+      // Parse response
+      readResponseHeaders();
+      return;
+    } catch (const std::exception& e) {
+      if (attempt >= 1) {
+        throw;
+      }
+      // The failed read left failbit set on the shared iostream, which would
+      // make the replayed request's writes no-ops. Clear it, then open a fresh
+      // socket (open() also resets the streambuf, dropping any bytes the failed
+      // request left half-written) before replaying.
+      this->connect(url);
+      socketStream.clear();
+    }
   }
-
-  // Write headers
-  for (auto& header : headers) {
-    socketStream << header.first << ": " << header.second << reqEnd;
-  }
-
-  socketStream << reqEnd;
-
-  // Write request body
-  if (content.size() > 0) {
-    socketStream.write((const char*)content.data(), content.size());
-  }
-
-  socketStream.flush();
-
-  // Parse response
-  readResponseHeaders();
 }
 
 void HTTPClient::Response::readResponseHeaders() {

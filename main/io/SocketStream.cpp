@@ -19,6 +19,15 @@ int SocketBuffer::open(const std::string& hostname, int port, bool isSSL) {
   }
 
   internalSocket->open(hostname, port);
+
+  // Jukebox-fix: a fresh socket must start with empty put/get areas. HTTPClient
+  // reopens this buffer to retry a request after a dropped keep-alive socket; if
+  // the prior request failed mid-write, obuf could still hold its bytes and get
+  // prepended to the replayed request. Resetting here guarantees a clean start.
+  // (For a first open this matches the lazy init that sync()/underflow() would
+  // otherwise perform, so the normal path is unchanged.)
+  setp(obuf, obuf + bufLen);
+  setg(nullptr, nullptr, nullptr);
   return 0;
 }
 
